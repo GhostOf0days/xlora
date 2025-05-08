@@ -31,7 +31,6 @@ def patch_transformers_attention():
                 print(f"Handling attention dimension mismatch: {error_msg}")
                 
                 # Extract dimensions from the error message
-                # Example error: "The expanded size of the tensor (200) must match the existing size (100) at non-singleton dimension 3"
                 import re
                 expanded_size = int(re.search(r"The expanded size of the tensor \((\d+)\)", error_msg).group(1))
                 existing_size = int(re.search(r"must match the existing size \((\d+)\)", error_msg).group(1))
@@ -39,11 +38,24 @@ def patch_transformers_attention():
                 # Process inputs normally up to the point where scaled_dot_product_attention would be called
                 bsz, q_len = hidden_states.shape[0], hidden_states.shape[1]
                 
+                # Get num_heads, num_key_value_heads, and head_dim attributes
+                # Account for different attribute names in different LlamaAttention versions
+                num_heads = getattr(self, "n_heads", None)
+                if num_heads is None:
+                    num_heads = getattr(self, "num_heads")
+                
+                num_key_value_heads = getattr(self, "n_kv_heads", None) 
+                if num_key_value_heads is None:
+                    num_key_value_heads = getattr(self, "num_key_value_heads", num_heads)
+                
+                head_dim = getattr(self, "head_dim")
+                hidden_size = getattr(self, "hidden_size", num_heads * head_dim)
+                
                 # Standard LlamaAttention forward pass
-                if self.config.pretraining_tp > 1:
-                    key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+                if hasattr(self, "config") and hasattr(self.config, "pretraining_tp") and self.config.pretraining_tp > 1:
+                    key_value_slicing = (num_key_value_heads * head_dim) // self.config.pretraining_tp
                     query_slices = self.q_proj.weight.split(
-                        (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+                        (num_heads * head_dim) // self.config.pretraining_tp, dim=0
                     )
                     key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
                     value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
@@ -61,9 +73,9 @@ def patch_transformers_attention():
                     key_states = self.k_proj(hidden_states)
                     value_states = self.v_proj(hidden_states)
 
-                query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-                key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-                value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+                key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+                value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
                 
                 if past_key_value is not None:
                     # Combine with past key and value states
@@ -93,7 +105,7 @@ def patch_transformers_attention():
                 
                 # Apply custom attention calculation
                 attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(
-                    torch.tensor(self.head_dim, dtype=query_states.dtype, device=query_states.device)
+                    torch.tensor(head_dim, dtype=query_states.dtype, device=query_states.device)
                 )
                 
                 if attention_mask is not None:
@@ -103,7 +115,7 @@ def patch_transformers_attention():
                 attn_output = torch.matmul(attn_weights, value_states)
                 
                 attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+                attn_output = attn_output.reshape(bsz, q_len, hidden_size)
                 
                 attn_output = self.o_proj(attn_output)
                 
@@ -114,4 +126,4 @@ def patch_transformers_attention():
     
     # Apply the patch
     LlamaAttention.forward = patched_forward
-    print("🔧 Patched LlamaAttention.forward to handle dimension mismatches in xLoRA") 
+    print("🔧 Patched LlamaAttention.forward to handle dimension mismatches in xLoRA")
