@@ -4,3 +4,7 @@ from .xlora import (
     from_pretrained,
 )
 from .xlora_config import xLoRAConfig
+from .xlora_attention_patch import patch_transformers_attention
+
+# Apply the attention patch when the module is imported
+patch_transformers_attention()
