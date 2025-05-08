@@ -225,10 +225,15 @@ def patch_transformers_attention():
                 
                 attn_output = self.o_proj(attn_output)
                 
-                if output_attentions:
+                # Match the expected return signature based on parameters
+                if use_cache and output_attentions:
                     return attn_output, attn_weights, past_key_value
-                else:
+                elif use_cache:
                     return attn_output, None, past_key_value
+                elif output_attentions:
+                    return attn_output, attn_weights
+                else:
+                    return attn_output, None
             else:
                 # Re-raise other errors
                 raise
