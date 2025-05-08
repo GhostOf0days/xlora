@@ -225,15 +225,15 @@ def patch_transformers_attention():
                 
                 attn_output = self.o_proj(attn_output)
                 
-                # Match the expected return signature based on parameters
-                if use_cache and output_attentions:
-                    return attn_output, attn_weights, past_key_value
-                elif use_cache:
-                    return attn_output, None, past_key_value
-                elif output_attentions:
-                    return attn_output, attn_weights
-                else:
-                    return attn_output, None
+                # Store the past_key_value in a context where it's expected
+                # but only return 2 values for generation
+                if past_key_value is not None:
+                    # Save the past_key_value somewhere for later use if needed
+                    setattr(self, '_last_past_key_value', past_key_value)
+                
+                # Check if we're in "generation" context - most likely we always need to return only 2 values
+                # as the DecoderLayer is expecting (hidden_states, self_attn_weights)
+                return attn_output, attn_weights
             else:
                 # Re-raise other errors
                 raise
