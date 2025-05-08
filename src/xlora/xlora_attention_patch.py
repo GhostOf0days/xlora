@@ -118,6 +118,9 @@ def patch_transformers_attention():
                 if isinstance(value_states, tuple):
                     value_states = value_states[0]
                 
+                # Store the original head dimension for later
+                original_head_dim = head_dim
+                
                 # Proper past_key_value handling with type checking
                 if past_key_value is not None:
                     # Extract past key and value tensors, handling nested tuples
@@ -153,30 +156,40 @@ def patch_transformers_attention():
                         value_states = value_states.repeat_interleave(head_repeat_factor, dim=1)
                         print(f"Repeated key/value states {head_repeat_factor}x to match query head count ({num_key_value_heads} -> {num_heads})")
                 
-                # This is the critical fix - handle dimension mismatch by resizing tensors
-                if expanded_size > existing_size:
-                    # Case when query is larger - resize key to match query
-                    key_len = key_states.size(2)
-                    key_states = torch.nn.functional.pad(
-                        key_states, 
-                        (0, expanded_size - existing_size, 0, 0, 0, 0, 0, 0),
-                        "constant", 0
-                    )
-                    print(f"Padded key states from shape {existing_size} to {expanded_size}")
-                else:
-                    # Case when key is larger - resize query to match key
-                    query_states = torch.nn.functional.pad(
-                        query_states, 
-                        (0, existing_size - expanded_size, 0, 0, 0, 0, 0, 0),
-                        "constant", 0
-                    )
-                    print(f"Padded query states from shape {expanded_size} to {existing_size}")
+                # Handle different head dimensions between query and key states (important for xLoRA with different ranks)
+                # Instead of padding, we'll resize to a fixed size to ensure consistency
+                query_head_dim = query_states.size(-1)
+                key_head_dim = key_states.size(-1)
+                
+                if query_head_dim != key_head_dim:
+                    print(f"Fixing head dimension mismatch: query={query_head_dim}, key={key_head_dim}")
+                    
+                    # Resize both query and key to the original head_dim (which should be 128 for Llama-3)
+                    if query_head_dim != original_head_dim:
+                        # Truncate or pad query head dimension to match original_head_dim
+                        if query_head_dim > original_head_dim:
+                            query_states = query_states[..., :original_head_dim]
+                            print(f"Truncated query head dim from {query_head_dim} to {original_head_dim}")
+                        else:
+                            query_states = F.pad(query_states, (0, original_head_dim - query_head_dim), "constant", 0)
+                            print(f"Padded query head dim from {query_head_dim} to {original_head_dim}")
+                    
+                    if key_head_dim != original_head_dim:
+                        # Truncate or pad key head dimension to match original_head_dim
+                        if key_head_dim > original_head_dim:
+                            key_states = key_states[..., :original_head_dim]
+                            value_states = value_states[..., :original_head_dim]
+                            print(f"Truncated key/value head dim from {key_head_dim} to {original_head_dim}")
+                        else:
+                            key_states = F.pad(key_states, (0, original_head_dim - key_head_dim), "constant", 0)
+                            value_states = F.pad(value_states, (0, original_head_dim - key_head_dim), "constant", 0)
+                            print(f"Padded key/value head dim from {key_head_dim} to {original_head_dim}")
                 
                 # Apply custom attention calculation
                 try:
                     # Try standard matmul approach first
                     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(
-                        torch.tensor(head_dim, dtype=query_states.dtype, device=query_states.device)
+                        torch.tensor(original_head_dim, dtype=query_states.dtype, device=query_states.device)
                     )
                     
                     if attention_mask is not None:
@@ -195,7 +208,7 @@ def patch_transformers_attention():
                     k_states = key_states.contiguous()
                     v_states = value_states.contiguous()
                     
-                    scaling = float(head_dim) ** -0.5
+                    scaling = float(original_head_dim) ** -0.5
                     attn_weights = torch.einsum("bhld,bhsd->bhls", q_states, k_states) * scaling
                     
                     if attention_mask is not None:
