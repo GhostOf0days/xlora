@@ -38,6 +38,15 @@ def convert_layers_to_xlora(
     """
     total_swapped = 0
 
+    # Check for bitsandbytes module
+    has_bnb = False
+    try:
+        import bitsandbytes as bnb
+        has_bnb = True
+    except ImportError:
+        if verbose:
+            print("bitsandbytes not found, quantized models may not work properly")
+    
     for module in base.modules():
         if isinstance(module, lora.Linear):
             new_layer: Union[xLoRALinearLayer, xLoRAEmbeddingLayer, xLoRAConv2dLayer] = xLoRALinearLayer(
@@ -61,6 +70,28 @@ def convert_layers_to_xlora(
             total_swapped += 1
         elif isinstance(module, lora.Conv2d):
             new_layer = xLoRAConv2dLayer(
+                model=base,
+                target=module,
+                target_forward=module.forward,
+                layer_number=total_swapped,
+                config=config,
+            )
+            module.forward = new_layer.forward  # type: ignore[method-assign]
+            total_swapped += 1
+        # Handle quantized models - 8-bit layers
+        elif has_bnb and hasattr(bnb, "nn") and hasattr(bnb.nn, "Linear8bitLt") and hasattr(lora, "Linear8bitLt") and isinstance(module, lora.Linear8bitLt):
+            new_layer = xLoRALinearLayer(
+                model=base,
+                target=module,
+                target_forward=module.forward,
+                layer_number=total_swapped,
+                config=config,
+            )
+            module.forward = new_layer.forward  # type: ignore[method-assign]
+            total_swapped += 1
+        # Handle quantized models - 4-bit layers
+        elif has_bnb and hasattr(bnb, "nn") and hasattr(bnb.nn, "Linear4bit") and hasattr(lora, "Linear4bit") and isinstance(module, lora.Linear4bit):
+            new_layer = xLoRALinearLayer(
                 model=base,
                 target=module,
                 target_forward=module.forward,
@@ -233,6 +264,9 @@ def add_xlora_to_model(
 
     assert not hasattr(model_peft, "clear_scalings_log")
     model_peft.clear_scalings_log = peft_model_wrapper.clear_scalings_log  # type: ignore
+
+    assert not hasattr(model_peft, "get_latest_scalings")
+    model_peft.get_latest_scalings = peft_model_wrapper.get_latest_scalings  # type: ignore
 
     model_peft.get_nb_trainable_parameters = peft_model_wrapper.get_nb_trainable_parameters  # type: ignore
 
