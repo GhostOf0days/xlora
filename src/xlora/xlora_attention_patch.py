@@ -38,41 +38,67 @@ def patch_transformers_attention():
                 # Process inputs normally up to the point where scaled_dot_product_attention would be called
                 bsz, q_len = hidden_states.shape[0], hidden_states.shape[1]
                 
-                # Get num_heads, num_key_value_heads, and head_dim attributes
-                # Account for different attribute names in different LlamaAttention versions
-                num_heads = getattr(self, "n_heads", None)
-                if num_heads is None:
-                    num_heads = getattr(self, "num_heads")
+                # Directly infer dimensions from module weights rather than attributes
+                # Look at the q_proj, k_proj weight shapes to infer dimensions
+                q_proj_out_dim = self.q_proj.weight.shape[0]
+                k_proj_out_dim = self.k_proj.weight.shape[0]
+                v_proj_out_dim = self.v_proj.weight.shape[0]
                 
-                num_key_value_heads = getattr(self, "n_kv_heads", None) 
-                if num_key_value_heads is None:
-                    num_key_value_heads = getattr(self, "num_key_value_heads", num_heads)
+                # For Llama3, q_proj is usually (num_heads * head_dim, hidden_size)
+                # and k_proj is (num_key_value_heads * head_dim, hidden_size)
                 
-                head_dim = getattr(self, "head_dim")
-                hidden_size = getattr(self, "hidden_size", num_heads * head_dim)
+                # Try to find head_dim in various ways
+                head_dim = None
+                
+                # Method 1: Check if head_dim is a direct attribute
+                if hasattr(self, "head_dim"):
+                    head_dim = self.head_dim
+                # Method 2: Check config
+                elif hasattr(self, "config") and hasattr(self.config, "head_dim"):
+                    head_dim = self.config.head_dim
+                # Method 3: Try common values (128 for Llama 3)
+                else:
+                    for common_dim in [128, 64, 80, 96, 160]:
+                        if q_proj_out_dim % common_dim == 0:
+                            head_dim = common_dim
+                            break
+                
+                if head_dim is None:
+                    # Last resort: just use what we see in error message dimensions
+                    head_dim = existing_size
+                
+                # Calculate num_heads and num_key_value_heads
+                num_heads = q_proj_out_dim // head_dim
+                num_key_value_heads = k_proj_out_dim // head_dim
+                hidden_size = self.o_proj.weight.shape[0]
+                
+                print(f"Inferred dimensions: num_heads={num_heads}, num_kv_heads={num_key_value_heads}, head_dim={head_dim}")
                 
                 # Standard LlamaAttention forward pass
-                if hasattr(self, "config") and hasattr(self.config, "pretraining_tp") and self.config.pretraining_tp > 1:
-                    key_value_slicing = (num_key_value_heads * head_dim) // self.config.pretraining_tp
+                if hasattr(self, "config") and hasattr(self.config, "pretraining_tp") and getattr(self.config, "pretraining_tp", 1) > 1:
+                    pretraining_tp = self.config.pretraining_tp
+                    key_value_slicing = (num_key_value_heads * head_dim) // pretraining_tp
                     query_slices = self.q_proj.weight.split(
-                        (num_heads * head_dim) // self.config.pretraining_tp, dim=0
+                        (num_heads * head_dim) // pretraining_tp, dim=0
                     )
                     key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
                     value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
-                    query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+                    query_states = [F.linear(hidden_states, query_slices[i]) for i in range(pretraining_tp)]
                     query_states = torch.cat(query_states, dim=-1)
 
-                    key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+                    key_states = [F.linear(hidden_states, key_slices[i]) for i in range(pretraining_tp)]
                     key_states = torch.cat(key_states, dim=-1)
 
-                    value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
+                    value_states = [F.linear(hidden_states, value_slices[i]) for i in range(pretraining_tp)]
                     value_states = torch.cat(value_states, dim=-1)
                 else:
+                    # Regular case
                     query_states = self.q_proj(hidden_states)
                     key_states = self.k_proj(hidden_states)
                     value_states = self.v_proj(hidden_states)
 
+                # Reshape
                 query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
                 key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
                 value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
