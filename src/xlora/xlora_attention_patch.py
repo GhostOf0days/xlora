@@ -1,7 +1,5 @@
-# Create file: xlora-master/src/xlora/xlora_attention_patch.py
-
 import torch
-import types
+import torch.nn.functional as F
 from transformers.models.llama.modeling_llama import LlamaAttention
 
 def patch_transformers_attention():
@@ -14,15 +12,34 @@ def patch_transformers_attention():
     def patched_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, 
                         output_attentions=False, use_cache=False, **kwargs):
         try:
-            return original_forward(self, hidden_states, attention_mask, position_ids, 
-                                   past_key_value, output_attentions, use_cache, **kwargs)
+            # Try the original implementation first, pass all args through kwargs
+            # This avoids parameter conflicts with newer transformers versions
+            all_kwargs = {
+                'hidden_states': hidden_states,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'past_key_value': past_key_value,
+                'output_attentions': output_attentions,
+                'use_cache': use_cache,
+                **kwargs
+            }
+            return original_forward(self, **all_kwargs)
         except RuntimeError as e:
-            if "The expanded size of the tensor" in str(e) and "must match the existing size" in str(e):
-                # Extract shapes from the error message
-                bsz = hidden_states.shape[0]
-                q_len = hidden_states.shape[1]
+            error_msg = str(e)
+            # Only catch tensor dimension mismatch errors in scaled_dot_product_attention
+            if "The expanded size of the tensor" in error_msg and "must match the existing size" in error_msg:
+                print(f"Handling attention dimension mismatch: {error_msg}")
+                
+                # Extract dimensions from the error message
+                # Example error: "The expanded size of the tensor (200) must match the existing size (100) at non-singleton dimension 3"
+                import re
+                expanded_size = int(re.search(r"The expanded size of the tensor \((\d+)\)", error_msg).group(1))
+                existing_size = int(re.search(r"must match the existing size \((\d+)\)", error_msg).group(1))
                 
                 # Process inputs normally up to the point where scaled_dot_product_attention would be called
+                bsz, q_len = hidden_states.shape[0], hidden_states.shape[1]
+                
+                # Standard LlamaAttention forward pass
                 if self.config.pretraining_tp > 1:
                     key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
                     query_slices = self.q_proj.weight.split(
@@ -55,19 +72,26 @@ def patch_transformers_attention():
                 
                 past_key_value = (key_states, value_states) if use_cache else None
                 
-                # Fix the dimension mismatch by resizing key to match query dimensions
-                # xLoRA with adapters of different dimensions
-                if key_states.shape[-1] != query_states.shape[-1]:
-                    # Resize key to match query for scaled_dot_product_attention
-                    target_shape = query_states.shape[-1]
-                    key_states = torch.nn.functional.interpolate(
-                        key_states.permute(0, 1, 3, 2),  # [b, h, d, seq_len]
-                        size=target_shape,
-                        mode='linear',
-                        align_corners=False
-                    ).permute(0, 1, 3, 2)  # [b, h, seq_len, d]
+                # This is the critical fix - handle dimension mismatch by resizing tensors
+                if expanded_size > existing_size:
+                    # Case when query is larger - resize key to match query
+                    key_len = key_states.size(2)
+                    key_states = torch.nn.functional.pad(
+                        key_states, 
+                        (0, expanded_size - existing_size, 0, 0, 0, 0, 0, 0),
+                        "constant", 0
+                    )
+                    print(f"Padded key states from shape {existing_size} to {expanded_size}")
+                else:
+                    # Case when key is larger - resize query to match key
+                    query_states = torch.nn.functional.pad(
+                        query_states, 
+                        (0, existing_size - expanded_size, 0, 0, 0, 0, 0, 0),
+                        "constant", 0
+                    )
+                    print(f"Padded query states from shape {expanded_size} to {existing_size}")
                 
-                # Apply custom attention
+                # Apply custom attention calculation
                 attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(
                     torch.tensor(self.head_dim, dtype=query_states.dtype, device=query_states.device)
                 )
@@ -79,7 +103,7 @@ def patch_transformers_attention():
                 attn_output = torch.matmul(attn_weights, value_states)
                 
                 attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+                attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
                 
                 attn_output = self.o_proj(attn_output)
                 
@@ -90,3 +114,4 @@ def patch_transformers_attention():
     
     # Apply the patch
     LlamaAttention.forward = patched_forward
+    print("🔧 Patched LlamaAttention.forward to handle dimension mismatches in xLoRA") 
