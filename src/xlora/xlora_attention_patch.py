@@ -141,6 +141,18 @@ def patch_transformers_attention():
                 
                 past_key_value = (key_states, value_states) if use_cache else None
                 
+                # Handle grouped query attention (GQA) where num_heads > num_key_value_heads
+                if num_heads > num_key_value_heads:
+                    # Repeat key and value states to match query heads
+                    # For GQA: Each key/value head is used for multiple query heads
+                    head_repeat_factor = num_heads // num_key_value_heads
+                    
+                    if head_repeat_factor > 1:
+                        # [batch, num_kv_heads, seq_len, head_dim] -> [batch, num_heads, seq_len, head_dim]
+                        key_states = key_states.repeat_interleave(head_repeat_factor, dim=1)
+                        value_states = value_states.repeat_interleave(head_repeat_factor, dim=1)
+                        print(f"Repeated key/value states {head_repeat_factor}x to match query head count ({num_key_value_heads} -> {num_heads})")
+                
                 # This is the critical fix - handle dimension mismatch by resizing tensors
                 if expanded_size > existing_size:
                     # Case when query is larger - resize key to match query
