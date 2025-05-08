@@ -41,7 +41,7 @@ class xLoRALayer:
         # scalings_layer = [batch_size, seq_len, n_classes]
         scalings = scalings_layer[:, :, adapter].unsqueeze(-1)
         # scalings_layer = [batch_size, seq_len, 1]
-        return x * scalings
+        return x * scalings.to(x.device)  # Fix: ensure tensors are on same device
 
     def get_maybe_topk_scalings(self) -> torch.Tensor:
         # xlora_scalings = [batch_size, seq_len, n_classes]
@@ -249,7 +249,12 @@ class PeftModelWrapper:
         """
         Returns the latest scalings prediction, or None if no scalings have been predicted. The tensor is of shape (batch_size, seq_len, n_layers, n_classes).
         """
-        return self.model.internal_xlora_scalings
+        if self.model.internal_xlora_scalings is None:
+            return None
+        
+        # Ensure scalings are on the correct device
+        device = next(self.model.parameters()).device
+        return self.model.internal_xlora_scalings.to(device)
 
     def get_scalings_log(self) -> List[Tensor]:
         """
