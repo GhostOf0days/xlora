@@ -110,13 +110,6 @@ def patch_transformers_attention():
                 key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
                 value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
                 
-                if past_key_value is not None:
-                    # Combine with past key and value states
-                    key_states = torch.cat([past_key_value[0], key_states], dim=2)
-                    value_states = torch.cat([past_key_value[1], value_states], dim=2)
-                
-                past_key_value = (key_states, value_states) if use_cache else None
-                
                 # Ensure we have tensors, not tuples
                 if isinstance(query_states, tuple):
                     query_states = query_states[0]
@@ -124,7 +117,30 @@ def patch_transformers_attention():
                     key_states = key_states[0]
                 if isinstance(value_states, tuple):
                     value_states = value_states[0]
+                
+                # Proper past_key_value handling with type checking
+                if past_key_value is not None:
+                    # Extract past key and value tensors, handling nested tuples
+                    def get_tensor(x, idx=0):
+                        if x is None:
+                            return None
+                        if isinstance(x, torch.Tensor):
+                            return x
+                        elif isinstance(x, tuple) and len(x) > idx:
+                            return get_tensor(x[idx])
+                        return None
                     
+                    past_key = get_tensor(past_key_value, 0)
+                    past_value = get_tensor(past_key_value, 1)
+                    
+                    # Only concatenate if both tensors are available
+                    if past_key is not None:
+                        key_states = torch.cat([past_key, key_states], dim=2)
+                    if past_value is not None:
+                        value_states = torch.cat([past_value, value_states], dim=2)
+                
+                past_key_value = (key_states, value_states) if use_cache else None
+                
                 # This is the critical fix - handle dimension mismatch by resizing tensors
                 if expanded_size > existing_size:
                     # Case when query is larger - resize key to match query
