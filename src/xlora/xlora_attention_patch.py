@@ -74,6 +74,13 @@ def patch_transformers_attention():
                 
                 print(f"Inferred dimensions: num_heads={num_heads}, num_kv_heads={num_key_value_heads}, head_dim={head_dim}")
                 
+                # Create dummy causal attention mask for our computation
+                # [bsz, 1, tgt_len, src_len]
+                causal_mask = torch.ones((bsz, 1, q_len, q_len), dtype=torch.bool, device=hidden_states.device)
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+                causal_mask = causal_mask.to(dtype=hidden_states.dtype)  # fp16 compatibility
+                causal_mask = causal_mask * torch.finfo(hidden_states.dtype).min
+                
                 # Standard LlamaAttention forward pass
                 if hasattr(self, "config") and hasattr(self.config, "pretraining_tp") and getattr(self.config, "pretraining_tp", 1) > 1:
                     pretraining_tp = self.config.pretraining_tp
@@ -110,6 +117,14 @@ def patch_transformers_attention():
                 
                 past_key_value = (key_states, value_states) if use_cache else None
                 
+                # Ensure we have tensors, not tuples
+                if isinstance(query_states, tuple):
+                    query_states = query_states[0]
+                if isinstance(key_states, tuple):
+                    key_states = key_states[0]
+                if isinstance(value_states, tuple):
+                    value_states = value_states[0]
+                    
                 # This is the critical fix - handle dimension mismatch by resizing tensors
                 if expanded_size > existing_size:
                     # Case when query is larger - resize key to match query
@@ -130,22 +145,49 @@ def patch_transformers_attention():
                     print(f"Padded query states from shape {expanded_size} to {existing_size}")
                 
                 # Apply custom attention calculation
-                attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(
-                    torch.tensor(head_dim, dtype=query_states.dtype, device=query_states.device)
-                )
-                
-                if attention_mask is not None:
-                    attn_weights = attn_weights + attention_mask
-                
-                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-                attn_output = torch.matmul(attn_weights, value_states)
+                try:
+                    # Try standard matmul approach first
+                    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(
+                        torch.tensor(head_dim, dtype=query_states.dtype, device=query_states.device)
+                    )
+                    
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
+                    else:
+                        # Add causal mask
+                        attn_weights = attn_weights + causal_mask
+                    
+                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                    attn_output = torch.matmul(attn_weights, value_states)
+                except TypeError as e:
+                    print(f"Caught TypeError: {e}")
+                    # Fall back to einsum for extra safety
+                    print("Falling back to einsum implementation")
+                    q_states = query_states.contiguous()
+                    k_states = key_states.contiguous()
+                    v_states = value_states.contiguous()
+                    
+                    scaling = float(head_dim) ** -0.5
+                    attn_weights = torch.einsum("bhld,bhsd->bhls", q_states, k_states) * scaling
+                    
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
+                    else:
+                        # Add causal mask
+                        attn_weights = attn_weights + causal_mask
+                        
+                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                    attn_output = torch.einsum("bhls,bhsd->bhld", attn_weights, v_states)
                 
                 attn_output = attn_output.transpose(1, 2).contiguous()
                 attn_output = attn_output.reshape(bsz, q_len, hidden_size)
                 
                 attn_output = self.o_proj(attn_output)
                 
-                return attn_output, attn_weights, past_key_value
+                if output_attentions:
+                    return attn_output, attn_weights, past_key_value
+                else:
+                    return attn_output, None, past_key_value
             else:
                 # Re-raise other errors
                 raise
