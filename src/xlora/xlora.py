@@ -178,10 +178,12 @@ def add_xlora_to_model(
 
             del kwargs_real["_xlora_classifier_inhibitor_flag"]
 
-            model_peft.internal_xlora_scalings = torch.full(  # type: ignore
+            scalings = torch.full(
                 (payload.batch_size, payload.seq_len, xlora_classifier.n_layers, xlora_classifier.n_classes),
                 payload.override_scaling_pass_value,
             )
+            # Move scalings to the correct device
+            model_peft.internal_xlora_scalings = scalings.to(xlora_config.device)  # Fix: ensure correct device
 
             return
 
@@ -214,6 +216,7 @@ def add_xlora_to_model(
 
     n_classes = len(xlora_config.adapters)
     xlora_classifier = xLoRAClassifier(model_peft, xlora_config, n_classes, total_swapped)
+    xlora_classifier.to(xlora_config.device)  # Fix: Move classifier to correct device
 
     # Setup the internal state
     base_model_wrapper = BaseTunerWrapper(model_peft.base_model, xlora_classifier)
